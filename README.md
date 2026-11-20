@@ -103,7 +103,7 @@ session on the person's state volume and does not share it between people.
 The publish workflow pushes `ghcr.io/bartolomeo-roberti/whatsapp-mcp` with the
 tags `main` and `sha-<short>`. The catalogue entry currently carries the
 placeholder digest
-`ghcr.io/bartolomeo-roberti/whatsapp-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000`;
+`ghcr.io/bartolomeo-roberti/whatsapp-mcp@sha256:f8c80fcc66db74b530a87ba7cc28a54ddc9bb106455a0b6ebd31e81f6111418e`;
 after the first publish, copy the real digest from the workflow summary into
 `cerase.json`.
 
