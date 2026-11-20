@@ -1,0 +1,6 @@
+This repository packages the third-party lharries/whatsapp-mcp
+(https://github.com/lharries/whatsapp-mcp), Copyright (c) 2025 Luke Harries,
+licensed under the MIT License. The upstream source is fetched at a pinned
+commit at build time; this repository carries only patches against it and the
+packaging code. The MIT licence text is in LICENSE. This repository is not
+affiliated with or endorsed by the upstream author or WhatsApp.

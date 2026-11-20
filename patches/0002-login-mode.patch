@@ -1,0 +1,137 @@
+diff --git a/whatsapp-bridge/main.go b/whatsapp-bridge/main.go
+index e7e30f5..cb215e7 100644
+--- a/whatsapp-bridge/main.go
++++ b/whatsapp-bridge/main.go
+@@ -786,7 +786,113 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port
+ 	}()
+ }
+ 
++// runLogin links a phone to a fresh session and returns the process status.
++// It prints the QR the upstream bridge prints, keeps printing a fresh one as
++// the previous expires, and exits 0 as soon as the phone has linked the device
++// and whatsmeow has stored the session. A stored session needs no QR: the
++// runner is already linked, so this exits 0 immediately.
++func runLogin(client *whatsmeow.Client, logger waLog.Logger) int {
++	if client.Store.ID != nil {
++		fmt.Println("WhatsApp is already linked; nothing to do")
++		return 0
++	}
++
++	pairSuccess := make(chan struct{}, 1)
++	connected := make(chan struct{}, 1)
++	client.AddEventHandler(func(evt interface{}) {
++		switch evt.(type) {
++		case *events.PairSuccess:
++			select {
++			case pairSuccess <- struct{}{}:
++			default:
++			}
++		case *events.Connected:
++			select {
++			case connected <- struct{}{}:
++			default:
++			}
++		}
++	})
++
++	qrChan, err := client.GetQRChannel(context.Background())
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "WhatsApp login failed: cannot start QR pairing: %v\n", err)
++		return 1
++	}
++	if err := client.Connect(); err != nil {
++		fmt.Fprintf(os.Stderr, "WhatsApp login failed: cannot connect: %v\n", err)
++		return 1
++	}
++
++	timeout := time.NewTimer(15 * time.Minute)
++	defer timeout.Stop()
++	for {
++		select {
++		case evt, ok := <-qrChan:
++			if !ok {
++				fmt.Fprintln(os.Stderr, "WhatsApp login failed: the QR channel closed before the phone linked the device")
++				client.Disconnect()
++				return 1
++			}
++			switch evt.Event {
++			case whatsmeow.QRChannelEventCode:
++				fmt.Println("\nScan this QR code with your WhatsApp app:")
++				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
++			case whatsmeow.QRChannelSuccess.Event:
++				// PairSuccess is dispatched just before the channel reports
++				// success; wait for it, then for Connected (or a short grace
++				// period) so whatsmeow has flushed the session to
++				// store/whatsapp.db before the process exits.
++				select {
++				case <-pairSuccess:
++				case <-time.After(5 * time.Second):
++				}
++				select {
++				case <-connected:
++				case <-time.After(5 * time.Second):
++				}
++				client.Disconnect()
++				fmt.Println("WhatsApp device linked and session stored")
++				return 0
++			case whatsmeow.QRChannelTimeout.Event:
++				fmt.Fprintln(os.Stderr, "WhatsApp login failed: the QR code expired before the phone linked the device")
++				client.Disconnect()
++				return 1
++			case whatsmeow.QRChannelErrUnexpectedEvent.Event,
++				whatsmeow.QRChannelClientOutdated.Event,
++				whatsmeow.QRChannelScannedWithoutMultidevice.Event:
++				fmt.Fprintf(os.Stderr, "WhatsApp login failed: pairing ended with %q\n", evt.Event)
++				client.Disconnect()
++				return 1
++			default:
++				if evt.Error != nil {
++					fmt.Fprintf(os.Stderr, "WhatsApp login failed: %v\n", evt.Error)
++					client.Disconnect()
++					return 1
++				}
++				// passkey-request and passkey-confirmation are intermediate
++				// events; keep waiting for a code, success, timeout or error.
++			}
++		case <-timeout.C:
++			fmt.Fprintln(os.Stderr, "WhatsApp login failed: timed out after 15 minutes waiting for the phone to scan the QR code")
++			client.Disconnect()
++			return 1
++		}
++	}
++}
++
+ func main() {
++	// Cerase runs the image with --login to link the phone by QR, and without
++	// arguments as the long-running runner. In login mode there is no REST
++	// server and no message handling: the process prints the QR, waits for the
++	// phone, and exits as soon as the session is stored.
++	loginMode := false
++	for _, arg := range os.Args[1:] {
++		if arg == "--login" {
++			loginMode = true
++		}
++	}
++
+ 	// Set up logger
+ 	logger := waLog.Stdout("Client", "INFO", true)
+ 	logger.Infof("Starting WhatsApp client...")
+@@ -826,6 +932,18 @@ func main() {
+ 		return
+ 	}
+ 
++	if loginMode {
++		os.Exit(runLogin(client, logger))
++	}
++
++	// Without --login this is the runner. A bridge with no stored session has
++	// nothing to serve, so it must not print a QR and wait: the entrypoint
++	// reports this line and stops.
++	if client.Store.ID == nil {
++		fmt.Fprintln(os.Stderr, "WhatsApp is not linked: run the image with --login and scan the QR code with the phone first")
++		os.Exit(1)
++	}
++
+ 	// Initialize message store
+ 	messageStore, err := NewMessageStore()
+ 	if err != nil {

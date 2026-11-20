@@ -1,0 +1,49 @@
+{
+  "schema_version": 2,
+  "namespace": "reale.errante",
+  "name": "whatsapp",
+  "type": "connector",
+  "display_name": "WhatsApp - Personal use",
+  "description": "A community package built on lharries/whatsapp-mcp. Each person links their own WhatsApp number by scanning a QR code; automating a personal account is outside WhatsApp's terms and can get the number blocked.",
+  "license": "MIT",
+  "tags": [
+    "whatsapp",
+    "messaging",
+    "social"
+  ],
+  "install": {
+    "image": "ghcr.io/bartolomeo-roberti/whatsapp-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "state": {
+      "path": "/home/pwuser/.whatsapp-mcp",
+      "max_mb": 500
+    },
+    "memory_mb": 512
+  },
+  "hosts": [
+    "whatsapp.com",
+    "*.whatsapp.com",
+    "*.whatsapp.net"
+  ],
+  "auth": {
+    "kind": "browser",
+    "credential_scope": "user",
+    "login": {
+      "args": [
+        "--login"
+      ]
+    }
+  },
+  "tool_side_effects": {
+    "default": "workspace_write",
+    "read_only": [
+      "search_contacts",
+      "list_messages",
+      "list_chats",
+      "get_chat",
+      "get_direct_chat_by_contact",
+      "get_contact_chats",
+      "get_last_interaction",
+      "get_message_context"
+    ]
+  }
+}
