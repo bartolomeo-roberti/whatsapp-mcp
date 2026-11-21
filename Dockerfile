@@ -22,6 +22,7 @@ RUN for patch in /patches/*.patch; do \
     done
 
 WORKDIR /src/whatsapp-bridge
+RUN CGO_ENABLED=1 GOTOOLCHAIN=local go test ./...
 RUN CGO_ENABLED=1 GOTOOLCHAIN=local \
     go build -trimpath -ldflags='-s -w' -o /out/whatsapp-bridge .
 

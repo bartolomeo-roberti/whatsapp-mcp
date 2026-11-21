@@ -37,6 +37,14 @@ flags=(
     --memory 512m
 )
 
+# The LID name patch is part of the build context, and the compiled bridge is
+# present in the runtime image.
+[[ -f patches/0004-resolve-lid-names.patch ]] ||
+    fail "patches/0004-resolve-lid-names.patch is missing"
+docker run --rm "${flags[@]}" --entrypoint test "$image" \
+    -x /opt/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge >/dev/null 2>&1 ||
+    fail "the built bridge binary is missing from the image"
+
 # (d) Nothing runs as root at run time.
 configured_user=$(docker inspect -f '{{.Config.User}}' "$image") ||
     fail "cannot inspect $image"

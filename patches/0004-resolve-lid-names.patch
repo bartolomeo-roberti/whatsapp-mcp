@@ -1,0 +1,356 @@
+diff --git a/whatsapp-bridge/main.go b/whatsapp-bridge/main.go
+index fac6320..986f236 100644
+--- a/whatsapp-bridge/main.go
++++ b/whatsapp-bridge/main.go
+@@ -1026,6 +1026,16 @@ func main() {
+ 	// Start REST API server
+ 	startRESTServer(client, messageStore, 8080)
+ 
++	// The REST server is up: fill in names for direct chats that only have a
++	// number, and retry whenever contacts or push names are synced.
++	refreshDirectChatNames(context.Background(), client, messageStore, logger)
++	client.AddEventHandler(func(evt interface{}) {
++		switch evt.(type) {
++		case *events.AppStateSyncComplete, *events.PushName:
++			refreshDirectChatNames(context.Background(), client, messageStore, logger)
++		}
++	})
++
+ 	// Create a channel to keep the main goroutine alive
+ 	exitChan := make(chan os.Signal, 1)
+ 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
+@@ -1040,16 +1050,151 @@ func main() {
+ 	client.Disconnect()
+ }
+ 
++// isDigitsOnly reports whether s consists only of ASCII digits.
++func isDigitsOnly(s string) bool {
++	if s == "" {
++		return false
++	}
++	for _, r := range s {
++		if r < '0' || r > '9' {
++			return false
++		}
++	}
++	return true
++}
++
++// isUsableChatName reports whether s can be shown as a person's name: it must
++// be non-empty and must not be only digits (a bare phone or LID number).
++func isUsableChatName(s string) bool {
++	s = strings.TrimSpace(s)
++	return s != "" && !isDigitsOnly(s)
++}
++
++// contactName returns the best usable name from a cached contact entry.
++func contactName(contact types.ContactInfo) string {
++	for _, candidate := range []string{contact.FullName, contact.FirstName, contact.PushName, contact.BusinessName} {
++		if isUsableChatName(candidate) {
++			return strings.TrimSpace(candidate)
++		}
++	}
++	return ""
++}
++
++// storedChatName returns the usable name stored for jid in the chats table.
++func (store *MessageStore) storedChatName(jid types.JID) string {
++	var name string
++	if err := store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", jid.String()).Scan(&name); err != nil {
++		return ""
++	}
++	if !isUsableChatName(name) {
++		return ""
++	}
++	return strings.TrimSpace(name)
++}
++
++// resolveDirectName finds the best human name for a direct chat. A LID chat's
++// contact is usually stored under the matching phone JID (and the reverse can
++// happen too), so both identities are consulted, first in the contact store
++// and then in the names already stored for the chats.
++func resolveDirectName(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, jid types.JID) string {
++	if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
++		return ""
++	}
++
++	jids := []types.JID{jid}
++	if jid.Server == types.HiddenUserServer {
++		if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
++			jids = append(jids, pn)
++		}
++	} else if lid, err := client.Store.LIDs.GetLIDForPN(ctx, jid); err == nil && !lid.IsEmpty() {
++		jids = append(jids, lid)
++	}
++
++	for _, candidate := range jids {
++		contact, err := client.Store.Contacts.GetContact(ctx, candidate)
++		if err != nil {
++			continue
++		}
++		if name := contactName(contact); name != "" {
++			return name
++		}
++	}
++	for _, candidate := range jids {
++		if name := messageStore.storedChatName(candidate); name != "" {
++			return name
++		}
++	}
++	return ""
++}
++
++// refreshDirectChatNames fills in names for direct chats whose stored name is
++// empty or only digits. It only logs how many rows changed.
++func refreshDirectChatNames(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
++	type chatRow struct {
++		jid  string
++		name string
++	}
++
++	rows, err := messageStore.db.Query("SELECT jid, name FROM chats WHERE jid NOT LIKE '%@g.us'")
++	if err != nil {
++		logger.Warnf("Failed to read chats for name refresh")
++		return
++	}
++	var pending []chatRow
++	for rows.Next() {
++		var row chatRow
++		if err := rows.Scan(&row.jid, &row.name); err != nil {
++			continue
++		}
++		if !isUsableChatName(row.name) {
++			pending = append(pending, row)
++		}
++	}
++	if err := rows.Err(); err != nil {
++		logger.Warnf("Failed to read chats for name refresh")
++	}
++	rows.Close()
++
++	updated := 0
++	for _, row := range pending {
++		if strings.HasSuffix(row.jid, "@g.us") {
++			continue
++		}
++		jid, err := types.ParseJID(row.jid)
++		if err != nil {
++			continue
++		}
++		name := resolveDirectName(ctx, client, messageStore, jid)
++		if name == "" || name == row.name {
++			continue
++		}
++		if _, err := messageStore.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, row.jid); err != nil {
++			continue
++		}
++		updated++
++	}
++	if updated > 0 {
++		logger.Infof("updated %d chat names", updated)
++	}
++}
++
+ // GetChatName determines the appropriate name for a chat based on JID and other info
+ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
+ 	// First, check if chat already exists in database with a name
+ 	var existingName string
+ 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
+-	if err == nil && existingName != "" {
+-		// Chat exists with a name, use that
++	if err == nil && isUsableChatName(existingName) {
++		// Chat exists with a usable name, use that
+ 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
+ 		return existingName
+ 	}
++	if err == nil && existingName != "" && jid.Server != types.GroupServer {
++		// A stored number is not a name; prefer one resolved from the contact
++		// store or the matching chat row.
++		if name := resolveDirectName(context.Background(), client, messageStore, jid); name != "" {
++			return name
++		}
++	}
+ 
+ 	// Need to determine chat name
+ 	var name string
+@@ -1105,16 +1250,17 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
+ 		// This is an individual contact
+ 		logger.Infof("Getting name for contact: %s", chatJID)
+ 
+-		// Just use contact info (full name)
+-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+-		if err == nil && contact.FullName != "" {
+-			name = contact.FullName
+-		} else if sender != "" {
+-			// Fallback to sender
+-			name = sender
+-		} else {
+-			// Last fallback to JID
+-			name = jid.User
++		// Prefer a real name from the contact store, resolving a LID to its
++		// phone identity when needed.
++		name = resolveDirectName(context.Background(), client, messageStore, jid)
++		if name == "" {
++			if sender != "" {
++				// Fallback to sender
++				name = sender
++			} else {
++				// Last fallback to JID
++				name = jid.User
++			}
+ 		}
+ 
+ 		logger.Infof("Using contact name: %s", name)
+diff --git a/whatsapp-bridge/names_test.go b/whatsapp-bridge/names_test.go
+new file mode 100644
+index 0000000..6639931
+--- /dev/null
++++ b/whatsapp-bridge/names_test.go
+@@ -0,0 +1,147 @@
++package main
++
++import (
++	"context"
++	"database/sql"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"go.mau.fi/whatsmeow"
++	"go.mau.fi/whatsmeow/proto/waAdv"
++	"go.mau.fi/whatsmeow/store/sqlstore"
++	"go.mau.fi/whatsmeow/types"
++	waLog "go.mau.fi/whatsmeow/util/log"
++)
++
++// newTestMessageStore creates the message database used by the bridge, in a
++// temporary directory.
++func newTestMessageStore(t *testing.T) *MessageStore {
++	t.Helper()
++	db, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "messages.db")+"?_foreign_keys=on")
++	if err != nil {
++		t.Fatalf("open message store: %v", err)
++	}
++	t.Cleanup(func() { _ = db.Close() })
++	_, err = db.Exec(`
++		CREATE TABLE IF NOT EXISTS chats (
++			jid TEXT PRIMARY KEY,
++			name TEXT,
++			last_message_time TIMESTAMP
++		);
++	`)
++	if err != nil {
++		t.Fatalf("create chats table: %v", err)
++	}
++	return &MessageStore{db: db}
++}
++
++// newTestClient creates a whatsmeow client backed by a temporary sqlite store.
++func newTestClient(t *testing.T) *whatsmeow.Client {
++	t.Helper()
++	ctx := context.Background()
++	container, err := sqlstore.New(ctx, "sqlite3",
++		"file:"+filepath.Join(t.TempDir(), "whatsapp.db")+"?_foreign_keys=on", waLog.Noop)
++	if err != nil {
++		t.Fatalf("open whatsmeow store: %v", err)
++	}
++	t.Cleanup(func() { _ = container.Close() })
++
++	device := container.NewDevice()
++	device.ID = &types.JID{User: "99999999999", Server: types.DefaultUserServer}
++	device.Account = &waAdv.ADVSignedDeviceIdentity{
++		Details:             []byte{},
++		AccountSignature:    make([]byte, 64),
++		AccountSignatureKey: make([]byte, 32),
++		DeviceSignature:     make([]byte, 64),
++	}
++	if err := container.PutDevice(ctx, device); err != nil {
++		t.Fatalf("save device: %v", err)
++	}
++	return whatsmeow.NewClient(device, waLog.Noop)
++}
++
++func TestResolveDirectName(t *testing.T) {
++	ctx := context.Background()
++	client := newTestClient(t)
++	messageStore := newTestMessageStore(t)
++
++	lidJID := types.NewJID("100000000000001", types.HiddenUserServer)
++	phoneJID := types.NewJID("10000000001", types.DefaultUserServer)
++	if err := client.Store.LIDs.PutLIDMapping(ctx, lidJID, phoneJID); err != nil {
++		t.Fatalf("put LID mapping: %v", err)
++	}
++	if err := client.Store.Contacts.PutContactName(ctx, phoneJID, "Alice", "Alice Example"); err != nil {
++		t.Fatalf("put contact name: %v", err)
++	}
++
++	if got := resolveDirectName(ctx, client, messageStore, lidJID); got != "Alice Example" {
++		t.Errorf("LID name = %q, want %q", got, "Alice Example")
++	}
++	if got := resolveDirectName(ctx, client, messageStore, phoneJID); got != "Alice Example" {
++		t.Errorf("phone name = %q, want %q", got, "Alice Example")
++	}
++
++	unknownLID := types.NewJID("100000000000099", types.HiddenUserServer)
++	if got := resolveDirectName(ctx, client, messageStore, unknownLID); got != "" {
++		t.Errorf("unknown LID name = %q, want empty", got)
++	}
++
++	digitsPN := types.NewJID("10000000002", types.DefaultUserServer)
++	if _, _, err := client.Store.Contacts.PutPushName(ctx, digitsPN, "10000000002"); err != nil {
++		t.Fatalf("put push name: %v", err)
++	}
++	if got := resolveDirectName(ctx, client, messageStore, digitsPN); got != "" {
++		t.Errorf("digits-only push name = %q, want empty", got)
++	}
++
++	// A named phone-JID chat names its LID chat when the contact store has no
++	// entry for either.
++	chatLID := types.NewJID("100000000000003", types.HiddenUserServer)
++	chatPN := types.NewJID("10000000003", types.DefaultUserServer)
++	if err := client.Store.LIDs.PutLIDMapping(ctx, chatLID, chatPN); err != nil {
++		t.Fatalf("put LID mapping: %v", err)
++	}
++	if err := messageStore.StoreChat(chatPN.String(), "Bob Example", time.Now()); err != nil {
++		t.Fatalf("store chat: %v", err)
++	}
++	if got := resolveDirectName(ctx, client, messageStore, chatLID); got != "Bob Example" {
++		t.Errorf("LID name from phone chat row = %q, want %q", got, "Bob Example")
++	}
++
++	// And the reverse: an unnamed phone-JID chat takes the name of its mapped
++	// LID chat.
++	revPN := types.NewJID("10000000004", types.DefaultUserServer)
++	revLID := types.NewJID("100000000000004", types.HiddenUserServer)
++	if err := client.Store.LIDs.PutLIDMapping(ctx, revLID, revPN); err != nil {
++		t.Fatalf("put LID mapping: %v", err)
++	}
++	if err := messageStore.StoreChat(revLID.String(), "Carol Example", time.Now()); err != nil {
++		t.Fatalf("store chat: %v", err)
++	}
++	if got := resolveDirectName(ctx, client, messageStore, revPN); got != "Carol Example" {
++		t.Errorf("phone name from LID chat row = %q, want %q", got, "Carol Example")
++	}
++}
++
++func TestIsDigitsOnly(t *testing.T) {
++	tests := []struct {
++		name string
++		in   string
++		want bool
++	}{
++		{"empty", "", false},
++		{"digits", "10000000001", true},
++		{"zeros", "000", true},
++		{"letter", "1000000000a", false},
++		{"space", "100 000", false},
++		{"name", "Alice", false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := isDigitsOnly(tt.in); got != tt.want {
++				t.Errorf("isDigitsOnly(%q) = %v, want %v", tt.in, got, tt.want)
++			}
++		})
++	}
++}

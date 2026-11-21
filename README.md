@@ -87,10 +87,14 @@ message database and are marked `read_only` in `cerase.json`:
 | `send_audio_message` | sends an audio message |
 | `download_media` | writes a media file to the state volume |
 
-`send_message`, `send_file`, `send_audio_message` and `download_media` are not
-marked read-only because they send through WhatsApp or write a file. ffmpeg is
+The eight read-only tools run without approval. `send_message`, `send_file`,
+`send_audio_message` and `download_media` wait for the person's approval in the
+console; a message sent that way leaves from the person's own number. ffmpeg is
 not installed, so `send_audio_message` can send an existing `.ogg` file but
 cannot convert other formats; `send_file` still sends the file as a document.
+
+Chat names come from the contacts synced to the linked phone. A chat with no
+saved name keeps its number.
 
 ## Risk
 
