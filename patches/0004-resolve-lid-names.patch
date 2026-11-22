@@ -1,5 +1,5 @@
 diff --git a/whatsapp-bridge/main.go b/whatsapp-bridge/main.go
-index fac6320..986f236 100644
+index fac6320..da2843f 100644
 --- a/whatsapp-bridge/main.go
 +++ b/whatsapp-bridge/main.go
 @@ -1026,6 +1026,16 @@ func main() {
@@ -19,7 +19,7 @@ index fac6320..986f236 100644
  	// Create a channel to keep the main goroutine alive
  	exitChan := make(chan os.Signal, 1)
  	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
-@@ -1040,16 +1050,151 @@ func main() {
+@@ -1040,16 +1050,251 @@ func main() {
  	client.Disconnect()
  }
  
@@ -43,14 +43,36 @@ index fac6320..986f236 100644
 +	return s != "" && !isDigitsOnly(s)
 +}
 +
-+// contactName returns the best usable name from a cached contact entry.
-+func contactName(contact types.ContactInfo) string {
-+	for _, candidate := range []string{contact.FullName, contact.FirstName, contact.PushName, contact.BusinessName} {
-+		if isUsableChatName(candidate) {
-+			return strings.TrimSpace(candidate)
-+		}
++// Contact name priority: lower is better. A name from the address book (full,
++// first or business) always beats the push name a person chose for themselves.
++const (
++	nameLevelFull = iota
++	nameLevelFirst
++	nameLevelBusiness
++	nameLevelPush
++	nameLevelUnknown
++)
++
++// contactNameAt returns the usable name at one priority level from a cached
++// contact entry.
++func contactNameAt(contact types.ContactInfo, level int) string {
++	var candidate string
++	switch level {
++	case nameLevelFull:
++		candidate = contact.FullName
++	case nameLevelFirst:
++		candidate = contact.FirstName
++	case nameLevelBusiness:
++		candidate = contact.BusinessName
++	case nameLevelPush:
++		candidate = contact.PushName
++	default:
++		return ""
 +	}
-+	return ""
++	if !isUsableChatName(candidate) {
++		return ""
++	}
++	return strings.TrimSpace(candidate)
 +}
 +
 +// storedChatName returns the usable name stored for jid in the chats table.
@@ -65,13 +87,11 @@ index fac6320..986f236 100644
 +	return strings.TrimSpace(name)
 +}
 +
-+// resolveDirectName finds the best human name for a direct chat. A LID chat's
-+// contact is usually stored under the matching phone JID (and the reverse can
-+// happen too), so both identities are consulted, first in the contact store
-+// and then in the names already stored for the chats.
-+func resolveDirectName(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, jid types.JID) string {
++// directIdentities returns the identities of a direct chat: its own JID first,
++// then the mapped phone or LID JID. Groups and other servers have none.
++func directIdentities(ctx context.Context, client *whatsmeow.Client, jid types.JID) []types.JID {
 +	if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
-+		return ""
++		return nil
 +	}
 +
 +	jids := []types.JID{jid}
@@ -82,14 +102,76 @@ index fac6320..986f236 100644
 +	} else if lid, err := client.Store.LIDs.GetLIDForPN(ctx, jid); err == nil && !lid.IsEmpty() {
 +		jids = append(jids, lid)
 +	}
++	return jids
++}
 +
-+	for _, candidate := range jids {
-+		contact, err := client.Store.Contacts.GetContact(ctx, candidate)
-+		if err != nil {
-+			continue
++// addressBookName returns the best usable address-book name for a direct chat:
++// a full name, then a first name, then a business name, over both identities.
++func addressBookName(ctx context.Context, client *whatsmeow.Client, jid types.JID) (string, int) {
++	jids := directIdentities(ctx, client, jid)
++	for _, level := range []int{nameLevelFull, nameLevelFirst, nameLevelBusiness} {
++		for _, candidate := range jids {
++			contact, err := client.Store.Contacts.GetContact(ctx, candidate)
++			if err != nil {
++				continue
++			}
++			if name := contactNameAt(contact, level); name != "" {
++				return name, level
++			}
 +		}
-+		if name := contactName(contact); name != "" {
-+			return name
++	}
++	return "", nameLevelUnknown
++}
++
++// addressBookLevel returns the priority of a stored name when it is also an
++// address-book name of one of the chat's identities, or nameLevelUnknown.
++func addressBookLevel(ctx context.Context, client *whatsmeow.Client, jid types.JID, name string) int {
++	jids := directIdentities(ctx, client, jid)
++	for _, level := range []int{nameLevelFull, nameLevelFirst, nameLevelBusiness} {
++		for _, candidate := range jids {
++			contact, err := client.Store.Contacts.GetContact(ctx, candidate)
++			if err != nil {
++				continue
++			}
++			if contactNameAt(contact, level) == name {
++				return level
++			}
++		}
++	}
++	return nameLevelUnknown
++}
++
++// betterAddressBookName reports the address-book name that should replace the
++// stored one. It only suggests a name that is higher priority, so a stored full
++// name is never replaced by a first or business name.
++func betterAddressBookName(ctx context.Context, client *whatsmeow.Client, jid types.JID, stored string) (string, bool) {
++	best, bestLevel := addressBookName(ctx, client, jid)
++	if best == "" || best == stored {
++		return "", false
++	}
++	storedLevel := addressBookLevel(ctx, client, jid, stored)
++	if storedLevel != nameLevelUnknown && bestLevel > storedLevel {
++		return "", false
++	}
++	return best, true
++}
++
++// resolveDirectName finds the best human name for a direct chat. A LID chat's
++// contact is usually stored under the matching phone JID (and the reverse can
++// happen too), so both identities are consulted. Address-book names come first
++// (full, first, business), then the push name, then the names already stored
++// for the chats.
++func resolveDirectName(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, jid types.JID) string {
++	jids := directIdentities(ctx, client, jid)
++	for _, level := range []int{nameLevelFull, nameLevelFirst, nameLevelBusiness, nameLevelPush} {
++		for _, candidate := range jids {
++			contact, err := client.Store.Contacts.GetContact(ctx, candidate)
++			if err != nil {
++				continue
++			}
++			if name := contactNameAt(contact, level); name != "" {
++				return name
++			}
 +		}
 +	}
 +	for _, candidate := range jids {
@@ -101,7 +183,8 @@ index fac6320..986f236 100644
 +}
 +
 +// refreshDirectChatNames fills in names for direct chats whose stored name is
-+// empty or only digits. It only logs how many rows changed.
++// empty or only digits, and upgrades a stored push name to an address-book name
++// that is now available. It only logs how many rows changed.
 +func refreshDirectChatNames(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
 +	type chatRow struct {
 +		jid  string
@@ -113,15 +196,13 @@ index fac6320..986f236 100644
 +		logger.Warnf("Failed to read chats for name refresh")
 +		return
 +	}
-+	var pending []chatRow
++	var chats []chatRow
 +	for rows.Next() {
 +		var row chatRow
 +		if err := rows.Scan(&row.jid, &row.name); err != nil {
 +			continue
 +		}
-+		if !isUsableChatName(row.name) {
-+			pending = append(pending, row)
-+		}
++		chats = append(chats, row)
 +	}
 +	if err := rows.Err(); err != nil {
 +		logger.Warnf("Failed to read chats for name refresh")
@@ -129,7 +210,7 @@ index fac6320..986f236 100644
 +	rows.Close()
 +
 +	updated := 0
-+	for _, row := range pending {
++	for _, row := range chats {
 +		if strings.HasSuffix(row.jid, "@g.us") {
 +			continue
 +		}
@@ -137,7 +218,18 @@ index fac6320..986f236 100644
 +		if err != nil {
 +			continue
 +		}
-+		name := resolveDirectName(ctx, client, messageStore, jid)
++		var name string
++		if !isUsableChatName(row.name) {
++			// No name yet: use the full resolution, which may end in a push
++			// name or the name of the mapped chat.
++			name = resolveDirectName(ctx, client, messageStore, jid)
++		} else {
++			best, ok := betterAddressBookName(ctx, client, jid, row.name)
++			if !ok {
++				continue
++			}
++			name = best
++		}
 +		if name == "" || name == row.name {
 +			continue
 +		}
@@ -159,6 +251,14 @@ index fac6320..986f236 100644
 -	if err == nil && existingName != "" {
 -		// Chat exists with a name, use that
 +	if err == nil && isUsableChatName(existingName) {
++		if jid.Server != types.GroupServer {
++			// A stored push name is not as good as an address-book name that
++			// is now available; a stored full name is never downgraded.
++			if name, ok := betterAddressBookName(context.Background(), client, jid, existingName); ok {
++				logger.Infof("Upgrading chat name for %s: %s -> %s", chatJID, existingName, name)
++				return name
++			}
++		}
 +		// Chat exists with a usable name, use that
  		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
  		return existingName
@@ -173,7 +273,7 @@ index fac6320..986f236 100644
  
  	// Need to determine chat name
  	var name string
-@@ -1105,16 +1250,17 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
+@@ -1105,16 +1350,17 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
  		// This is an individual contact
  		logger.Infof("Getting name for contact: %s", chatJID)
  
@@ -203,10 +303,10 @@ index fac6320..986f236 100644
  		logger.Infof("Using contact name: %s", name)
 diff --git a/whatsapp-bridge/names_test.go b/whatsapp-bridge/names_test.go
 new file mode 100644
-index 0000000..6639931
+index 0000000..1247eec
 --- /dev/null
 +++ b/whatsapp-bridge/names_test.go
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,243 @@
 +package main
 +
 +import (
@@ -330,6 +430,102 @@ index 0000000..6639931
 +	}
 +	if got := resolveDirectName(ctx, client, messageStore, revPN); got != "Carol Example" {
 +		t.Errorf("phone name from LID chat row = %q, want %q", got, "Carol Example")
++	}
++}
++
++func TestResolveDirectNamePrefersAddressBook(t *testing.T) {
++	ctx := context.Background()
++	client := newTestClient(t)
++	messageStore := newTestMessageStore(t)
++
++	lidJID := types.NewJID("100000000000011", types.HiddenUserServer)
++	phoneJID := types.NewJID("10000000011", types.DefaultUserServer)
++	if err := client.Store.LIDs.PutLIDMapping(ctx, lidJID, phoneJID); err != nil {
++		t.Fatalf("put LID mapping: %v", err)
++	}
++	// The LID only carries the push name the person chose; the address-book
++	// name lives on the mapped phone identity.
++	if _, _, err := client.Store.Contacts.PutPushName(ctx, lidJID, "Ali"); err != nil {
++		t.Fatalf("put LID push name: %v", err)
++	}
++	if err := client.Store.Contacts.PutContactName(ctx, phoneJID, "", "Alice Example"); err != nil {
++		t.Fatalf("put phone contact name: %v", err)
++	}
++	if _, _, err := client.Store.Contacts.PutPushName(ctx, phoneJID, "Ali"); err != nil {
++		t.Fatalf("put phone push name: %v", err)
++	}
++
++	if got := resolveDirectName(ctx, client, messageStore, lidJID); got != "Alice Example" {
++		t.Errorf("LID name = %q, want %q", got, "Alice Example")
++	}
++	if got := resolveDirectName(ctx, client, messageStore, phoneJID); got != "Alice Example" {
++		t.Errorf("phone name = %q, want %q", got, "Alice Example")
++	}
++}
++
++func TestRefreshDirectChatNamesUpgradesAddressBook(t *testing.T) {
++	ctx := context.Background()
++	client := newTestClient(t)
++	messageStore := newTestMessageStore(t)
++
++	lidJID := types.NewJID("100000000000012", types.HiddenUserServer)
++	phoneJID := types.NewJID("10000000012", types.DefaultUserServer)
++	if err := client.Store.LIDs.PutLIDMapping(ctx, lidJID, phoneJID); err != nil {
++		t.Fatalf("put LID mapping: %v", err)
++	}
++	if _, _, err := client.Store.Contacts.PutPushName(ctx, lidJID, "Ali"); err != nil {
++		t.Fatalf("put LID push name: %v", err)
++	}
++	if err := client.Store.Contacts.PutContactName(ctx, phoneJID, "", "Alice Example"); err != nil {
++		t.Fatalf("put phone contact name: %v", err)
++	}
++	if _, _, err := client.Store.Contacts.PutPushName(ctx, phoneJID, "Ali"); err != nil {
++		t.Fatalf("put phone push name: %v", err)
++	}
++
++	if err := messageStore.StoreChat(lidJID.String(), "Ali", time.Now()); err != nil {
++		t.Fatalf("store LID chat: %v", err)
++	}
++	if err := messageStore.StoreChat(phoneJID.String(), "Alice Example", time.Now()); err != nil {
++		t.Fatalf("store phone chat: %v", err)
++	}
++
++	refreshDirectChatNames(ctx, client, messageStore, waLog.Noop)
++
++	if got := messageStore.storedChatName(lidJID); got != "Alice Example" {
++		t.Errorf("LID chat name = %q, want %q", got, "Alice Example")
++	}
++	if got := messageStore.storedChatName(phoneJID); got != "Alice Example" {
++		t.Errorf("phone chat name = %q, want %q", got, "Alice Example")
++	}
++}
++
++func TestRefreshDirectChatNamesKeepsPushName(t *testing.T) {
++	ctx := context.Background()
++	client := newTestClient(t)
++	messageStore := newTestMessageStore(t)
++
++	lidJID := types.NewJID("100000000000013", types.HiddenUserServer)
++	phoneJID := types.NewJID("10000000013", types.DefaultUserServer)
++	if err := client.Store.LIDs.PutLIDMapping(ctx, lidJID, phoneJID); err != nil {
++		t.Fatalf("put LID mapping: %v", err)
++	}
++	if _, _, err := client.Store.Contacts.PutPushName(ctx, lidJID, "Ali"); err != nil {
++		t.Fatalf("put LID push name: %v", err)
++	}
++	if _, _, err := client.Store.Contacts.PutPushName(ctx, phoneJID, "Ali"); err != nil {
++		t.Fatalf("put phone push name: %v", err)
++	}
++
++	if got := resolveDirectName(ctx, client, messageStore, lidJID); got != "Ali" {
++		t.Errorf("push-only LID name = %q, want %q", got, "Ali")
++	}
++	if err := messageStore.StoreChat(lidJID.String(), "Ali", time.Now()); err != nil {
++		t.Fatalf("store LID chat: %v", err)
++	}
++	refreshDirectChatNames(ctx, client, messageStore, waLog.Noop)
++	if got := messageStore.storedChatName(lidJID); got != "Ali" {
++		t.Errorf("push-only chat name = %q, want %q", got, "Ali")
 +	}
 +}
 +
