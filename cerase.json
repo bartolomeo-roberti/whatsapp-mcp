@@ -12,7 +12,7 @@
     "social"
   ],
   "install": {
-    "image": "ghcr.io/bartolomeo-roberti/whatsapp-mcp@sha256:a6e8def25d661d4e66cbaeeb824b22f5816d31f7d4385e597cd6ab1204c28c09",
+    "image": "ghcr.io/bartolomeo-roberti/whatsapp-mcp@sha256:fb844a08b31b1a0321cf3d7704f5eda7c94012a85a59b4b306ceb2624827b1bb",
     "state": {
       "path": "/home/pwuser/.whatsapp-mcp",
       "max_mb": 500
