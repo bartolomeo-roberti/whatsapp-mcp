@@ -1,0 +1,62 @@
+diff --git a/whatsapp-bridge/device_test.go b/whatsapp-bridge/device_test.go
+new file mode 100644
+index 0000000..58fbf2d
+--- /dev/null
++++ b/whatsapp-bridge/device_test.go
+@@ -0,0 +1,22 @@
++package main
++
++import (
++	"testing"
++
++	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
++	"go.mau.fi/whatsmeow/store"
++)
++
++func TestConfigureDeviceIdentity(t *testing.T) {
++	configureDeviceIdentity()
++
++	if got := store.DeviceProps.GetOs(); got != deviceName {
++		t.Fatalf("DeviceProps.Os = %q, want %q", got, deviceName)
++	}
++	if got := store.DeviceProps.GetPlatformType(); got != waCompanionReg.DeviceProps_DESKTOP {
++		t.Fatalf("DeviceProps.PlatformType = %v, want DESKTOP", got)
++	}
++	if store.DeviceProps.HistorySyncConfig == nil {
++		t.Fatal("DeviceProps.HistorySyncConfig is nil")
++	}
++}
+diff --git a/whatsapp-bridge/main.go b/whatsapp-bridge/main.go
+index da2843f..a78dd42 100644
+--- a/whatsapp-bridge/main.go
++++ b/whatsapp-bridge/main.go
+@@ -24,6 +24,8 @@ import (
+ 
+ 	"go.mau.fi/whatsmeow"
+ 	waProto "go.mau.fi/whatsmeow/binary/proto"
++	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
++	"go.mau.fi/whatsmeow/store"
+ 	"go.mau.fi/whatsmeow/store/sqlstore"
+ 	"go.mau.fi/whatsmeow/types"
+ 	"go.mau.fi/whatsmeow/types/events"
+@@ -881,7 +883,20 @@ func runLogin(client *whatsmeow.Client, logger waLog.Logger) int {
+ 	}
+ }
+ 
++// deviceName is the name WhatsApp lists for this linked companion device.
++const deviceName = "Cerase"
++
++// configureDeviceIdentity makes the bridge register as a desktop companion
++// named deviceName instead of whatsmeow's defaults. Every other DeviceProps
++// field, including HistorySyncConfig, is left as whatsmeow set it.
++func configureDeviceIdentity() {
++	store.DeviceProps.Os = proto.String(deviceName)
++	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
++}
++
+ func main() {
++	configureDeviceIdentity()
++
+ 	// Cerase runs the image with --login to link the phone by QR, and without
+ 	// arguments as the long-running runner. In login mode there is no REST
+ 	// server and no message handling: the process prints the QR, waits for the
