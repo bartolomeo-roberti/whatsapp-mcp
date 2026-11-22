@@ -30,7 +30,22 @@
     "login": {
       "args": [
         "--login"
-      ]
+      ],
+      "steps": {
+        "it": [
+          "Sul telefono apri WhatsApp e vai su Impostazioni, poi Dispositivi collegati.",
+          "Tocca «Collega un dispositivo» e inquadra il codice che compare qui sotto.",
+          "Il codice scade dopo circa 2 minuti e 40 secondi: se scade, usa «Ricomincia l'accesso».",
+          "Quando il telefono conferma il collegamento, questa pagina si aggiorna da sola."
+        ],
+        "en": [
+          "On your phone open WhatsApp and go to Settings, then Linked devices.",
+          "Tap Link a device and scan the code shown below.",
+          "The code expires after about 2 minutes 40 seconds: if it does, use Restart sign-in.",
+          "When the phone confirms the link, this page updates by itself."
+        ]
+      },
+      "code_seconds": 160
     }
   },
   "tool_side_effects": {
